@@ -1,7 +1,10 @@
 # %%
 import cplex
 import time
-import networkx as nx
+try:
+    import networkx as nx
+except ImportError:
+    raise ImportError("This script requires the 'networkx' library. Please install it using:\n\n    pip install networkx")
 from cplex.exceptions import CplexSolverError
 
 
@@ -55,16 +58,15 @@ class ColumnGeneration:
         self.n = graph.number_of_nodes()
         self.graph = graph
         self.complement_graph = nx.complement(self.graph)
-        self.maximal_cliques = list(nx.find_cliques(self.complement_graph))
         self.initial_cliques = list(find_maximal_cliques(self.complement_graph))
         self.restricted_master = cplex.Cplex()
-        self.dual = cplex.Cplex()
+        self.pricing = cplex.Cplex()
         self._create_rmp()
-        self._create_dual()
-        # Disable multithreading
+        self._create_pricing()
+        # Disable multithreading (behavior is kinda strange without it)
         if single_thread:
             self.restricted_master.parameters.threads.set(1)
-            self.dual.parameters.threads.set(1)
+            self.pricing.parameters.threads.set(1)
 
     def _create_rmp(self):
         self.restricted_master.set_log_stream(None)
@@ -79,16 +81,6 @@ class ColumnGeneration:
         # Add initial columns from maximal cliques
         for clique in self.initial_cliques:
             self._add_column_to_rmp(clique)
-        # for i in range(self.n):
-        #     self._add_column_to_rmp([i])
-        # covered = set()
-        # sorted_cliques = sorted(self.maximal_cliques, key=len, reverse=True)
-        # for clique in sorted_cliques:
-        #     if not set(clique).issubset(covered):
-        #         self._add_column_to_rmp(clique)
-        #         covered.update(clique)
-        #     if len(covered) == self.n:
-        #         break
 
     def _add_column_to_rmp(self, clique):
         """Add new column for a clique in complement graph (Independent
@@ -111,14 +103,14 @@ class ColumnGeneration:
         )
         self.restricted_master.set_problem_type(cplex.Cplex.problem_type.LP)
 
-    def _create_dual(self):
+    def _create_pricing(self):
         """Initialize Pricing Problem (Max Weight Clique in complement
         graph)
         """
-        self.dual.set_log_stream(None)
-        self.dual.set_results_stream(None)
+        self.pricing.set_log_stream(None)
+        self.pricing.set_results_stream(None)
         # Binary variables for vertices
-        self.dual.variables.add(
+        self.pricing.variables.add(
             names=[f"y{i}" for i in range(self.n)],
             types=["B"] * self.n,  # Binary variables
             lb=[0] * self.n,
@@ -132,14 +124,14 @@ class ColumnGeneration:
             constraint = cplex.SparsePair(ind=[f"y{u}", f"y{v}"], val=[1.0, 1.0])
             constraints.append(constraint)
 
-        self.dual.linear_constraints.add(
+        self.pricing.linear_constraints.add(
             lin_expr=constraints,
             senses=["L"] * len(constraints),  # y_u + y_v <= 1
             rhs=[1.0] * len(constraints),
         )
 
         # Maximization objective (weights set later)
-        self.dual.objective.set_sense(self.dual.objective.sense.maximize)
+        self.pricing.objective.set_sense(self.pricing.objective.sense.maximize)
 
     def solve(self, tol=1e-6, max_iter=100, time_limit=300):
         """Solve linear relaxation via column generation
@@ -159,7 +151,7 @@ class ColumnGeneration:
 
         # Set time limits
         self.restricted_master.parameters.timelimit.set(time_limit)
-        self.dual.parameters.timelimit.set(time_limit)
+        self.pricing.parameters.timelimit.set(time_limit)
 
         # For some obscure reason, cplex occasionally fails when not using multithreading
         # This avoids cplex error in these cases:
@@ -210,20 +202,20 @@ class ColumnGeneration:
             )
 
             # Update pricing objective with duals as weights
-            self.dual.objective.set_linear([(f"y{i}", duals[i]) for i in range(self.n)])
+            self.pricing.objective.set_linear([(f"y{i}", duals[i]) for i in range(self.n)])
 
             # Solve pricing problem
             pricing_start = time.time()
-            self.dual.solve()
+            self.pricing.solve()
             pricing_time = time.time() - pricing_start
             total_pricing_time += pricing_time
             # Check pricing solution status
-            if self.dual.solution.get_status() != self.dual.solution.status.MIP_optimal:
-                print(f"Pricing failed at iteration {iteration}")
+            if self.pricing.solution.get_status() != self.pricing.solution.status.MIP_optimal:
+                print(f"Pricing not optimal at iteration {iteration}. Solution status: {self.pricing.solution.get_status()}")
                 break
 
             # Get solution and calculate reduced cost
-            max_weight = self.dual.solution.get_objective_value()
+            max_weight = self.pricing.solution.get_objective_value()
             reduced_cost = 1 - max_weight
 
             # Check termination condition
@@ -234,7 +226,7 @@ class ColumnGeneration:
                 break
 
             # Get new clique (independent set in original graph)
-            y_vals = self.dual.solution.get_values()
+            y_vals = self.pricing.solution.get_values()
             new_clique = [i for i, val in enumerate(y_vals) if val > 0.5]
 
             if not new_clique:
@@ -278,36 +270,76 @@ class ColumnGeneration:
             "iterations": iterations,
         }
 
-for i in range(3):
-    print(f"\n#Solving problem gcol{i+1}")
-    g1 = read_dimacs(f"./data/gcol{i+1}.txt")
+for i in [1, 2, 3, 4, 5]:
+    print(f"\n#Solving problem gcol{i}.txt")
+    g1 = read_dimacs(f"./data/gcol{i}.txt")
     problem = ColumnGeneration(g1, single_thread=False)
-    res = problem.solve(max_iter=1000, tol=1e-6, time_limit=3000)
-# test = nx.complement(g1)
-# g1 = nx.mycielski_graph(5)
-# cliques = list(nx.find_cliques(test))
-# print(len(cliques))
-# cliques[4]
-# print(f"""Chi: {res['fractional_chi']}\nTotal time: {res['total_time']}
-# RMP Time: {res['rmp_time']}\nPricing Time: {res['pricing_time']}
-# Iterations: {res['iterations']}
-# """)
+    res = problem.solve(max_iter=1000, tol=1e-8, time_limit=3000)
+
+print("DONE")
 # %%
-problem.restricted_master.solve()
-problem.restricted_master.solution.get_dual_values()
-problem.dual.solve()
-print(cplex.Cplex().get_version())
-print(cplex.__file__)
-problem.restricted_master.write("debug.lp")
-names = problem.restricted_master.variables.get_names()
-for name in names[:5]:
-    col = problem.restricted_master.variables.get_cols(name)
-    print(name, col)
-
-
-print("Non-zero entries per constraint:")
-for i in range(problem.n):
-    row = problem.restricted_master.linear_constraints.get_rows(i)
-    print(f"v{i}: {len(row.ind)} non-zeros")
-
-len(g1.nodes())
+"""
+Generate graph coloring figure for paper
+"""
+# import networkx as nx
+# import matplotlib.pyplot as plt
+# from matplotlib.patches import Patch
+#
+# import numpy as np
+#
+# # Create original graph
+# G = nx.Graph()
+# edges = [('A','B'), ('A','C'), ('A','D'), ('A','E'), 
+#          ('B','C'), ('B','E'),
+#          ('C','D'), 
+#          ('D','E')]
+# G.add_edges_from(edges)
+#
+# # Create complement graph
+# H = nx.complement(G)
+#
+# # Vertex positions (pentagon layout)
+# pos = {
+#     'A': (0, 1),          # Top
+#     'B': (0.95, 0.31),    # Top-right
+#     'C': (0.59, -0.81),   # Bottom-right
+#     'D': (-0.59, -0.81),  # Bottom-left
+#     'E': (-0.95, 0.31)    # Top-left
+# }
+#
+# # Create figure
+# plt.figure(figsize=(12, 6))
+#
+# # Plot original graph
+# plt.subplot(121)
+# nx.draw_networkx_nodes(G, pos, node_size=700,
+#                        node_color=['red', 'blue', 'lime', 'blue', 'lime'],
+#                        nodelist=['A', 'B', 'C', 'D', 'E'])
+# nx.draw_networkx_edges(G, pos, width=2)
+# nx.draw_networkx_labels(G, pos, font_size=16, font_weight='bold')
+# plt.title("Original Graph $G$", fontsize=14)
+# plt.box(False)
+#
+# # Plot complement graph
+# plt.subplot(122)
+# nx.draw_networkx_nodes(H, pos, node_size=700,
+#                        node_color=['red', 'blue', 'lime', 'blue', 'lime'],
+#                        nodelist=['A', 'B', 'C', 'D', 'E'])
+# nx.draw_networkx_edges(H, pos, width=2, edge_color='green')
+# nx.draw_networkx_labels(H, pos, font_size=16, font_weight='bold')
+# plt.title(r"Complement Graph $\overline{G}$", fontsize=14)
+# plt.box(False)
+#
+# # Create custom legend
+# legend_elements = [
+#     plt.Line2D([0], [0], color='black', lw=2, label='Original Edges'),
+#     plt.Line2D([0], [0], color='green', lw=2, label='Complement Edges')
+# ]
+# plt.figlegend(handles=legend_elements, loc='lower center', ncol=3, frameon=False, fontsize=10)
+#
+# plt.tight_layout()
+# plt.subplots_adjust(bottom=0.25)
+# plt.subplots_adjust(top=0.95, bottom=0.25, hspace=0.2)  # MODIFIED LINE
+#
+# plt.savefig("pentagon_graph_complement.png", dpi=300, bbox_inches='tight')  # Added bbox_inches
+# plt.show()
